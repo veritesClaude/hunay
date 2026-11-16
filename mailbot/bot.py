@@ -30,7 +30,10 @@ HOSTS = {
     "icloud.com": "imap.mail.me.com", "me.com": "imap.mail.me.com",
     "rambler.ru": "imap.rambler.ru", "yahoo.com": "imap.mail.yahoo.com",
     "gmx.de": "imap.gmx.net", "gmx.net": "imap.gmx.net", "gmx.at": "imap.gmx.net",
-    "gmx.ch": "imap.gmx.net", "gmx.com": "imap.gmx.net",
+    "gmx.ch": "imap.gmx.net", "gmx.com": "imap.gmx.net", "mein.gmx": "imap.gmx.net",
+    "gmx.eu": "imap.gmx.net", "gmx.li": "imap.gmx.net", "gmx.fr": "imap.gmx.net", "gmx.es": "imap.gmx.net",
+    "outlook.de": "outlook.office365.com", "hotmail.de": "outlook.office365.com",
+    "live.com": "outlook.office365.com", "live.de": "outlook.office365.com", "msn.com": "outlook.office365.com",
     "web.de": "imap.web.de",
     "t-online.de": "secureimap.t-online.de",
     "freenet.de": "mx.freenet.de",
@@ -48,8 +51,14 @@ HELP_PASS = {
 _GMX = ("GMX: зайди в почту → Einstellungen → E-Mail → POP3 &amp; IMAP → включи «Zugriff auf GMX Postfach per "
         "POP3 und IMAP erlauben». Если включена двухфакторка — создай «Anwendungsspezifisches Passwort» "
         "(Einstellungen → Sicherheit) и используй его.")
-for _d in ("gmx.de", "gmx.net", "gmx.at", "gmx.ch", "gmx.com"):
+for _d in ("gmx.de", "gmx.net", "gmx.at", "gmx.ch", "gmx.com", "mein.gmx", "gmx.eu", "gmx.li", "gmx.fr", "gmx.es"):
     HELP_PASS[_d] = _GMX
+_OUTLOOK = ("Outlook/Hotmail: включи двухэтапную проверку и создай пароль приложения "
+            "(account.microsoft.com → Безопасность → Дополнительные параметры безопасности), "
+            "IMAP должен быть включён. Если Microsoft не пускает по паролю — это их ограничение "
+            "на вход без OAuth, а не ошибка бота.")
+for _d in ("outlook.com", "outlook.de", "hotmail.com", "hotmail.de", "live.com", "live.de", "msn.com"):
+    HELP_PASS[_d] = _OUTLOOK
 HELP_PASS["web.de"] = _GMX.replace("GMX", "WEB.DE").replace("GMX Postfach", "WEB.DE Postfach")
 
 db = sqlite3.connect(DB, check_same_thread=False)
