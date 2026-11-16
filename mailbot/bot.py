@@ -1,7 +1,8 @@
-import asyncio, imaplib, email, os, re, socket, sqlite3, html, logging, json, time
+import asyncio, hmac, imaplib, email, os, re, socket, sqlite3, html, logging, json, time
 import urllib.request, urllib.parse, urllib.error
 from email.header import decode_header, make_header
 from email.utils import parseaddr
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -23,6 +24,8 @@ DB = os.getenv("DB_PATH", "mailbot.db")
 MS_CLIENT_ID = os.getenv("MS_CLIENT_ID", "").strip()
 MS_TENANT = os.getenv("MS_TENANT", "consumers").strip() or "consumers"
 MS_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+WEBHOOK_KEY = os.getenv("WEBHOOK_KEY", "").strip()
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
 MS_DOMAINS = {"outlook.com", "outlook.de", "hotmail.com", "hotmail.de", "live.com", "live.de", "msn.com"}
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("mailbot")
@@ -671,7 +674,55 @@ async def on_error(event):
             pass
     return True
 
+def fmt_num(x):
+    x = (x or "").strip()
+    digits = re.sub(r"\D", "", x)
+    return "+" + digits if digits and re.fullmatch(r"[+\s\d()-]+", x) else x
+
+def find_code(text):
+    m = re.search(r"(?<![\d+])\d{3}[- ]\d{3}(?!\d)|(?<![\d+])\d{4,8}(?!\d)", text or "")
+    return m.group(0) if m else ""
+
+async def notify_sms(frm, to, msg):
+    code = find_code(msg)
+    head = f"📱 <b>SMS</b> на <code>{html.escape(fmt_num(to))}</code>\n<b>От:</b> {html.escape(fmt_num(frm))}\n"
+    if code: head += f"<b>Код:</b> <code>{html.escape(code)}</code>\n"
+    for uid in member_ids():
+        notify, show_body = get_pref(uid, "sms_code")
+        if not notify:
+            continue
+        text = head + ("\n" + html.escape(msg) if msg and show_body else "")
+        try:
+            await bot.send_message(uid, text[:4000])
+        except Exception as e:
+            log.warning("sms send to %s: %s", uid, e)
+
+async def sms_hook(request: web.Request):
+    raw = request.query_string
+    q = request.query
+    if not hmac.compare_digest(q.get("key", ""), WEBHOOK_KEY):
+        return web.Response(status=403, text="forbidden")
+    # msg должен идти в URL последним: берём всё после "msg=", даже если сервис не закодировал & и пробелы
+    i = raw.find("msg=")
+    msg = urllib.parse.unquote_plus(raw[i + 4:]) if i >= 0 else ""
+    frm, to = q.get("from", ""), q.get("to", "")
+    log.info("sms webhook: from=%s to=%s (%d chars)", fmt_num(frm), fmt_num(to), len(msg))
+    await notify_sms(frm, to, msg)
+    return web.Response(text="ok")
+
+async def start_webhook():
+    if not WEBHOOK_KEY:
+        log.info("webhook disabled (WEBHOOK_KEY is empty)")
+        return
+    app = web.Application()
+    app.router.add_get("/smswebhook", sms_hook)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT).start()
+    log.info("webhook listening on :%s", WEBHOOK_PORT)
+
 async def main():
+    await start_webhook()
     await bot.set_my_commands([BotCommand(command="start", description="Открыть меню")])
     asyncio.create_task(poll())
     await dp.start_polling(bot)

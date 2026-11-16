@@ -2,6 +2,7 @@
   mailbot-admin list            — все участники, включая скрытых
   mailbot-admin hide ID         — скрыть участника из списка «👥 Участники» (доступ и уведомления остаются)
   mailbot-admin unhide ID       — снова показывать
+  mailbot-admin webhook         — адрес для пересылки SMS (вебхук)
 """
 import os, sqlite3, sys
 
@@ -20,6 +21,13 @@ def main(argv):
         for uid, name, un, hid in db.execute(
                 "SELECT user_id, name, username, COALESCE(hidden,0) FROM users ORDER BY joined_at, user_id"):
             print(f"{uid}\t{name or '-'}\t{('@' + un) if un else '-'}\t{'СКРЫТ' if hid else ''}")
+        return 0
+    if cmd == "webhook":
+        key, port = os.getenv("WEBHOOK_KEY", ""), os.getenv("WEBHOOK_PORT", "8080")
+        if not key:
+            print("Вебхук выключен (нет WEBHOOK_KEY). Перезапусти установку."); return 1
+        host = os.getenv("WEBHOOK_HOST", "ВАШ_IP_ИЛИ_ДОМЕН")
+        print(f"http://{host}:{port}/smswebhook?key={key}&from=%FROM%&to=%TO%&msg=%MESSAGE%")
         return 0
     if cmd in ("hide", "unhide") and len(argv) == 2 and argv[1].lstrip("-").isdigit():
         uid, flag = int(argv[1]), 1 if cmd == "hide" else 0
