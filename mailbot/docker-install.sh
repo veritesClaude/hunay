@@ -6,7 +6,7 @@ TOKEN="$1"
 ID="${2:-}"
 [ -z "$TOKEN" ] && { echo "Укажи токен: bash docker-install.sh ТОКЕН [ID]"; exit 1; }
 
-BRANCH="ccr-dd0fe0f8-todiym"
+BRANCH="ccr-5d79bc22-6d67we"
 SRC_DIR="/opt/mailbot-src"
 DATA_DIR="/opt/mailbot-data"
 

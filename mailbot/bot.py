@@ -6,7 +6,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from cryptography.fernet import Fernet
@@ -39,8 +39,59 @@ db = sqlite3.connect(DB, check_same_thread=False)
 db.execute("""CREATE TABLE IF NOT EXISTS accounts(
  id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, email TEXT, pw TEXT,
  host TEXT, last_uid INTEGER DEFAULT 0, UNIQUE(chat_id,email))""")
+db.execute("""CREATE TABLE IF NOT EXISTS category_prefs(
+ chat_id INTEGER, category TEXT, notify INTEGER DEFAULT 1, body INTEGER DEFAULT 1,
+ PRIMARY KEY(chat_id,category))""")
 db.commit()
 dblock = asyncio.Lock()
+
+# Категории писем: правило срабатывает по теме/тексту, порядок важен (первое совпадение побеждает).
+CATEGORIES = {
+    "booking_request": "📩 Заявка на бронирование (Monteurzimmer)",
+    "listing_approved": "✅ Объявление одобрено (Monteurzimmer)",
+    "listing_rejected": "❌ Объявление отклонено (Monteurzimmer)",
+    "sms_code": "📱 SMS-коды (WhatsApp и т.п.)",
+    "other": "✉️ Остальные письма",
+}
+CATEGORY_ORDER = ["booking_request", "listing_approved", "listing_rejected", "sms_code", "other"]
+
+def classify(subject, body):
+    s = (subject or "").lower()
+    b = (body or "").lower()
+    if "monteurzimmer" in s:
+        if "buchungsanfrage" in s:
+            return "booking_request"
+        if "nicht veröffentlicht" in s or "nicht freigegeben" in s:
+            return "listing_rejected"
+        if "freigegeben" in s:
+            return "listing_approved"
+    if "business code" in b or "received sms from" in b:
+        return "sms_code"
+    return "other"
+
+def get_pref(chat_id, cat):
+    row = db.execute("SELECT notify, body FROM category_prefs WHERE chat_id=? AND category=?",
+                      (chat_id, cat)).fetchone()
+    return row if row else (1, 1)
+
+def toggle_pref(chat_id, cat, field):
+    db.execute("INSERT OR IGNORE INTO category_prefs(chat_id,category,notify,body) VALUES(?,?,1,1)",
+               (chat_id, cat))
+    db.execute(f"UPDATE category_prefs SET {field}=1-{field} WHERE chat_id=? AND category=?", (chat_id, cat))
+    db.commit()
+
+def categories_kb(chat_id):
+    rows = []
+    for cat in CATEGORY_ORDER:
+        notify, body = get_pref(chat_id, cat)
+        rows.append([InlineKeyboardButton(text=CATEGORIES[cat], callback_data="noop")])
+        rows.append([
+            InlineKeyboardButton(text=("🔔 Уведомлять: Вкл" if notify else "🔕 Уведомлять: Выкл"),
+                                  callback_data=f"catnotify:{cat}"),
+            InlineKeyboardButton(text=("📄 Текст письма: Вкл" if body else "📄 Текст письма: Выкл"),
+                                  callback_data=f"catbody:{cat}"),
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 class Add(StatesGroup):
     email = State(); host = State(); pw = State()
@@ -109,11 +160,16 @@ async def poll():
             try:
                 msgs, newlast = await asyncio.to_thread(fetch_new, host, em, FERNET.decrypt(pw.encode()).decode(), last)
                 for u, name, addr, subj, date, body, files in msgs:
+                    cat = classify(subj, body)
+                    notify, show_body = get_pref(chat, cat)
+                    if not notify:
+                        continue
                     text = (f"📬 <b>Новое письмо</b> → {html.escape(em)}\n"
                             f"<b>От:</b> {html.escape(name)} &lt;{html.escape(addr)}&gt;\n"
                             f"<b>Тема:</b> {html.escape(subj)}\n<b>Дата:</b> {html.escape(date)}\n")
+                    if cat != "other": text += f"<b>Тип:</b> {html.escape(CATEGORIES[cat])}\n"
                     if files: text += "📎 " + html.escape(", ".join(files)) + "\n"
-                    if body: text += "\n" + html.escape(body)
+                    if body and show_body: text += "\n" + html.escape(body)
                     await bot.send_message(chat, text[:4000])
                 if newlast != last:
                     db.execute("UPDATE accounts SET last_uid=? WHERE id=?", (newlast, id_)); db.commit()
@@ -125,7 +181,27 @@ async def start(m: Message):
     if not allowed(m): return
     await m.answer("Я пересылаю новые письма из твоей почты сюда.\n\n"
                    "/add — привязать почту\n/list — список привязанных ящиков\n"
-                   "/remove — отвязать ящик\n/cancel — отменить текущее действие")
+                   "/remove — отвязать ящик\n/categories — включить/выключить уведомления по типам писем\n"
+                   "/cancel — отменить текущее действие")
+
+@dp.message(Command("categories"))
+async def categories_cmd(m: Message):
+    if not allowed(m): return
+    await m.answer("Настрой уведомления по типам писем (жми на кнопки, чтобы переключить):",
+                   reply_markup=categories_kb(m.chat.id))
+
+@dp.callback_query(F.data == "noop")
+async def cat_noop(cq: CallbackQuery):
+    await cq.answer()
+
+@dp.callback_query(F.data.startswith("catnotify:") | F.data.startswith("catbody:"))
+async def cat_toggle(cq: CallbackQuery):
+    if ALLOWED and cq.from_user.id not in ALLOWED:
+        return await cq.answer()
+    action, cat = cq.data.split(":", 1)
+    toggle_pref(cq.message.chat.id, cat, "notify" if action == "catnotify" else "body")
+    await cq.message.edit_reply_markup(reply_markup=categories_kb(cq.message.chat.id))
+    await cq.answer("Обновлено")
 
 @dp.message(Command("cancel"))
 async def cancel(m: Message, state: FSMContext):
