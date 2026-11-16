@@ -6,7 +6,8 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+                            ReplyKeyboardMarkup, KeyboardButton, BotCommand)
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from cryptography.fernet import Fernet
@@ -91,7 +92,49 @@ def categories_kb(chat_id):
             InlineKeyboardButton(text=("📄 Текст письма: Вкл" if body else "📄 Текст письма: Выкл"),
                                   callback_data=f"catbody:{cat}"),
         ])
+    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+# ───────────────────────── стильное меню на кнопках ─────────────────────────
+
+REPLY_MENU = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="☰ Меню")]],
+                                  resize_keyboard=True, is_persistent=True)
+
+MAIN_TEXT = "🏠 <b>Главное меню</b>\n\nВыбери, что сделать 👇"
+
+def main_menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить почту", callback_data="menu:add")],
+        [InlineKeyboardButton(text="📋 Мои ящики", callback_data="menu:list")],
+        [InlineKeyboardButton(text="🔔 Категории писем", callback_data="menu:categories")],
+        [InlineKeyboardButton(text="❓ Помощь", callback_data="menu:help")],
+    ])
+
+CANCEL_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="❌ Отмена", callback_data="menu:cancel")]])
+
+HELP_TEXT = ("✨ <b>Mail → Telegram Bot</b>\n\n"
+             "Привязывай сколько угодно почтовых ящиков — бот следит за новыми письмами "
+             "по IMAP и присылает их сюда.\n\n"
+             "🔔 <b>Категории</b> — бот сам определяет тип письма (заявки/одобрения "
+             "Monteurzimmer, SMS-коды и т.п.) и для каждого типа можно отдельно включить/"
+             "выключить уведомления и показ полного текста.\n\n"
+             "🔐 Пароли от почты хранятся в зашифрованном виде.\n"
+             f"⏱ Проверка новых писем — раз в {INTERVAL} сек.")
+
+def list_view(chat_id):
+    rows = db.execute("SELECT id, email FROM accounts WHERE chat_id=? ORDER BY email", (chat_id,)).fetchall()
+    kb = []
+    for id_, em in rows:
+        kb.append([InlineKeyboardButton(text=f"🗑 {em}", callback_data=f"rm:{id_}")])
+    kb.append([InlineKeyboardButton(text="➕ Добавить ещё", callback_data="menu:add")])
+    kb.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:main")])
+    text = ("📋 <b>Привязанные ящики</b>\n\nЖми 🗑, чтобы отвязать ящик."
+            if rows else "📋 Пока ничего не привязано.\n\nНажми «➕ Добавить почту».")
+    return text, InlineKeyboardMarkup(inline_keyboard=kb)
+
+def allowed_cb(cq: CallbackQuery) -> bool:
+    return not ALLOWED or cq.from_user.id in ALLOWED
 
 class Add(StatesGroup):
     email = State(); host = State(); pw = State()
@@ -176,19 +219,18 @@ async def poll():
             except Exception as e:
                 log.warning("poll %s: %s", em, e)
 
-@dp.message(Command("start", "help"))
-async def start(m: Message):
+@dp.message(Command("start"))
+async def start(m: Message, state: FSMContext):
     if not allowed(m): return
-    await m.answer("Я пересылаю новые письма из твоей почты сюда.\n\n"
-                   "/add — привязать почту\n/list — список привязанных ящиков\n"
-                   "/remove — отвязать ящик\n/categories — включить/выключить уведомления по типам писем\n"
-                   "/cancel — отменить текущее действие")
+    await state.clear()
+    await m.answer(HELP_TEXT, reply_markup=REPLY_MENU)
+    await m.answer(MAIN_TEXT, reply_markup=main_menu_kb())
 
-@dp.message(Command("categories"))
-async def categories_cmd(m: Message):
+@dp.message(F.text == "☰ Меню")
+async def menu_button(m: Message, state: FSMContext):
     if not allowed(m): return
-    await m.answer("Настрой уведомления по типам писем (жми на кнопки, чтобы переключить):",
-                   reply_markup=categories_kb(m.chat.id))
+    await state.clear()
+    await m.answer(MAIN_TEXT, reply_markup=main_menu_kb())
 
 @dp.callback_query(F.data == "noop")
 async def cat_noop(cq: CallbackQuery):
@@ -196,42 +238,101 @@ async def cat_noop(cq: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("catnotify:") | F.data.startswith("catbody:"))
 async def cat_toggle(cq: CallbackQuery):
-    if ALLOWED and cq.from_user.id not in ALLOWED:
-        return await cq.answer()
+    if not allowed_cb(cq): return await cq.answer()
     action, cat = cq.data.split(":", 1)
     toggle_pref(cq.message.chat.id, cat, "notify" if action == "catnotify" else "body")
     await cq.message.edit_reply_markup(reply_markup=categories_kb(cq.message.chat.id))
     await cq.answer("Обновлено")
 
-@dp.message(Command("cancel"))
-async def cancel(m: Message, state: FSMContext):
-    await state.clear(); await m.answer("Отменено.")
+@dp.callback_query(F.data == "menu:main")
+async def menu_main(cq: CallbackQuery, state: FSMContext):
+    if not allowed_cb(cq): return await cq.answer()
+    await state.clear()
+    await cq.message.edit_text(MAIN_TEXT, reply_markup=main_menu_kb())
+    await cq.answer()
 
-@dp.message(Command("add"))
-async def add(m: Message, state: FSMContext):
-    if not allowed(m): return
+@dp.callback_query(F.data == "menu:help")
+async def menu_help(cq: CallbackQuery):
+    if not allowed_cb(cq): return await cq.answer()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:main")]])
+    await cq.message.edit_text(HELP_TEXT, reply_markup=kb)
+    await cq.answer()
+
+@dp.callback_query(F.data == "menu:categories")
+async def menu_categories(cq: CallbackQuery):
+    if not allowed_cb(cq): return await cq.answer()
+    await cq.message.edit_text("🔔 <b>Категории писем</b>\n\nЖми на кнопки, чтобы переключить:",
+                               reply_markup=categories_kb(cq.message.chat.id))
+    await cq.answer()
+
+@dp.callback_query(F.data == "menu:list")
+async def menu_list(cq: CallbackQuery):
+    if not allowed_cb(cq): return await cq.answer()
+    text, kb = list_view(cq.message.chat.id)
+    await cq.message.edit_text(text, reply_markup=kb)
+    await cq.answer()
+
+@dp.callback_query(F.data == "menu:cancel")
+async def menu_cancel(cq: CallbackQuery, state: FSMContext):
+    if not allowed_cb(cq): return await cq.answer()
+    await state.clear()
+    await cq.message.edit_text(MAIN_TEXT, reply_markup=main_menu_kb())
+    await cq.answer("Отменено")
+
+@dp.callback_query(F.data == "menu:add")
+async def menu_add(cq: CallbackQuery, state: FSMContext):
+    if not allowed_cb(cq): return await cq.answer()
     await state.set_state(Add.email)
-    await m.answer("Напиши адрес почты, например <code>name@gmail.com</code>")
+    await cq.message.edit_text("✉️ Напиши адрес почты, например <code>name@gmail.com</code>",
+                               reply_markup=CANCEL_KB)
+    await cq.answer()
+
+@dp.callback_query(F.data.startswith("rm:"))
+async def menu_rm_ask(cq: CallbackQuery):
+    if not allowed_cb(cq): return await cq.answer()
+    id_ = int(cq.data.split(":", 1)[1])
+    row = db.execute("SELECT email FROM accounts WHERE id=? AND chat_id=?", (id_, cq.message.chat.id)).fetchone()
+    if not row:
+        await cq.answer("Уже удалено");
+        text, kb = list_view(cq.message.chat.id)
+        return await cq.message.edit_text(text, reply_markup=kb)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"rmyes:{id_}"),
+         InlineKeyboardButton(text="❌ Отмена", callback_data="menu:list")]])
+    await cq.message.edit_text(f"Отвязать <b>{html.escape(row[0])}</b>?\nУведомления из этого ящика больше не "
+                               f"будут приходить.", reply_markup=kb)
+    await cq.answer()
+
+@dp.callback_query(F.data.startswith("rmyes:"))
+async def menu_rm_yes(cq: CallbackQuery):
+    if not allowed_cb(cq): return await cq.answer()
+    id_ = int(cq.data.split(":", 1)[1])
+    db.execute("DELETE FROM accounts WHERE id=? AND chat_id=?", (id_, cq.message.chat.id)); db.commit()
+    text, kb = list_view(cq.message.chat.id)
+    await cq.message.edit_text(text, reply_markup=kb)
+    await cq.answer("Отвязано")
 
 @dp.message(Add.email)
 async def add_email(m: Message, state: FSMContext):
     em = (m.text or "").strip().lower()
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", em):
-        return await m.answer("Не похоже на адрес почты. Попробуй ещё раз или /cancel")
+        return await m.answer("Не похоже на адрес почты. Попробуй ещё раз.", reply_markup=CANCEL_KB)
     dom = em.split("@")[1]
     await state.update_data(email=em)
     if dom in HOSTS:
         await state.update_data(host=HOSTS[dom]); await state.set_state(Add.pw)
         await m.answer(HELP_PASS.get(dom, "Нужен пароль приложения (не основной пароль).") +
-                       "\n\nОтправь пароль приложения. Сообщение с ним я сразу удалю.")
+                       "\n\nОтправь пароль приложения. Сообщение с ним я сразу удалю.", reply_markup=CANCEL_KB)
     else:
         await state.set_state(Add.host)
-        await m.answer(f"Не знаю IMAP-сервер для {dom}. Напиши его, например <code>imap.{dom}</code>")
+        await m.answer(f"Не знаю IMAP-сервер для {dom}. Напиши его, например <code>imap.{dom}</code>",
+                       reply_markup=CANCEL_KB)
 
 @dp.message(Add.host)
 async def add_host(m: Message, state: FSMContext):
     await state.update_data(host=(m.text or "").strip()); await state.set_state(Add.pw)
-    await m.answer("Отправь пароль (лучше пароль приложения). Сообщение с ним я сразу удалю.")
+    await m.answer("Отправь пароль (лучше пароль приложения). Сообщение с ним я сразу удалю.",
+                   reply_markup=CANCEL_KB)
 
 @dp.message(Add.pw)
 async def add_pw(m: Message, state: FSMContext):
@@ -244,31 +345,19 @@ async def add_pw(m: Message, state: FSMContext):
             u = max_uid(c); c.logout(); return u
         uid = await asyncio.to_thread(check)
     except Exception as e:
-        await state.clear()
+        await state.set_state(Add.pw)
         return await m.answer(f"❌ Не удалось войти: <code>{html.escape(str(e))[:300]}</code>\n"
-                              "Проверь, что включён IMAP и используется пароль приложения. Повтори: /add")
+                              "Проверь, что включён IMAP и используется пароль приложения. Пришли пароль ещё раз.",
+                              reply_markup=CANCEL_KB)
     db.execute("INSERT OR REPLACE INTO accounts(chat_id,email,pw,host,last_uid) VALUES(?,?,?,?,?)",
                (m.chat.id, d["email"], FERNET.encrypt(pw.encode()).decode(), d["host"], uid))
     db.commit(); await state.clear()
     await m.answer(f"✅ <b>{html.escape(d['email'])}</b> привязана. Старые письма не придут, только новые "
                    f"(проверка раз в {INTERVAL} сек).")
-
-@dp.message(Command("list"))
-async def lst(m: Message):
-    if not allowed(m): return
-    rows = db.execute("SELECT email FROM accounts WHERE chat_id=?", (m.chat.id,)).fetchall()
-    await m.answer("\n".join("• " + html.escape(r[0]) for r in rows) if rows else "Пока ничего не привязано. /add")
-
-@dp.message(Command("remove"))
-async def rem(m: Message):
-    if not allowed(m): return
-    parts = (m.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        return await m.answer("Напиши так: <code>/remove name@gmail.com</code>")
-    db.execute("DELETE FROM accounts WHERE chat_id=? AND email=?", (m.chat.id, parts[1].strip().lower()))
-    db.commit(); await m.answer("Готово, ящик отвязан.")
+    await m.answer(MAIN_TEXT, reply_markup=main_menu_kb())
 
 async def main():
+    await bot.set_my_commands([BotCommand(command="start", description="Открыть меню")])
     asyncio.create_task(poll())
     await dp.start_polling(bot)
 
