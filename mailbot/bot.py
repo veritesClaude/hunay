@@ -81,6 +81,10 @@ db.execute("""CREATE TABLE IF NOT EXISTS category_prefs(
 db.execute("""CREATE TABLE IF NOT EXISTS users(
  user_id INTEGER PRIMARY KEY, name TEXT DEFAULT '', username TEXT DEFAULT '',
  joined_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+try:
+    db.execute("ALTER TABLE users ADD COLUMN hidden INTEGER DEFAULT 0")
+except sqlite3.OperationalError:
+    pass
 db.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)")
 db.execute("INSERT OR IGNORE INTO users(user_id) SELECT DISTINCT chat_id FROM accounts")
 for _id in ALLOWED:
@@ -199,7 +203,8 @@ def allowed_cb(cq: CallbackQuery) -> bool:
     return is_member(cq.from_user.id)
 
 def users_view(me):
-    rows = db.execute("SELECT user_id, name, username FROM users ORDER BY joined_at, user_id").fetchall()
+    rows = db.execute("SELECT user_id, name, username FROM users WHERE COALESCE(hidden,0)=0 "
+                      "ORDER BY joined_at, user_id").fetchall()
     kb, lines = [], []
     for uid, name, un in rows:
         label = user_label(name, un) if (name or un) else f"ID {uid}"
@@ -427,7 +432,7 @@ async def reg_toggle(cq: CallbackQuery):
 async def user_rm_ask(cq: CallbackQuery):
     if not allowed_cb(cq): return await cq.answer()
     uid = int(cq.data.split(":", 1)[1])
-    row = db.execute("SELECT name, username FROM users WHERE user_id=?", (uid,)).fetchone()
+    row = db.execute("SELECT name, username FROM users WHERE user_id=? AND COALESCE(hidden,0)=0", (uid,)).fetchone()
     if not row:
         await cq.answer("Уже удалён")
         text, kb = users_view(cq.from_user.id)
@@ -450,6 +455,8 @@ async def user_rm_yes(cq: CallbackQuery):
     if not allowed_cb(cq): return await cq.answer()
     uid = int(cq.data.split(":", 1)[1])
     me = uid == cq.from_user.id
+    if db.execute("SELECT 1 FROM users WHERE user_id=? AND COALESCE(hidden,0)=0", (uid,)).fetchone() is None:
+        return await cq.answer("Уже удалён")
     if me and len(member_ids()) == 1:
         return await cq.answer("Ты единственный участник — выйти нельзя", show_alert=True)
     db.execute("DELETE FROM users WHERE user_id=?", (uid,))

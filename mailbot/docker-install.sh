@@ -39,6 +39,12 @@ docker run -d --name mailbot --restart unless-stopped \
   -v "$DATA_DIR:/data" \
   mailbot
 
+cat > /usr/local/bin/mailbot-admin <<'EOS'
+#!/bin/bash
+exec docker exec mailbot python admin.py "$@"
+EOS
+chmod +x /usr/local/bin/mailbot-admin
+
 sleep 2
 docker ps --filter name=mailbot --format "{{.Status}}"
 echo "ГОТОВО: бот запущен в Docker. Логи: docker logs -f mailbot"
