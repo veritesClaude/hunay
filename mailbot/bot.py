@@ -1,4 +1,4 @@
-import asyncio, imaplib, email, os, re, sqlite3, html, logging
+import asyncio, imaplib, email, os, re, socket, sqlite3, html, logging
 from email.header import decode_header, make_header
 from email.utils import parseaddr
 from aiogram import Bot, Dispatcher, F
@@ -29,12 +29,28 @@ HOSTS = {
     "outlook.com": "outlook.office365.com", "hotmail.com": "outlook.office365.com",
     "icloud.com": "imap.mail.me.com", "me.com": "imap.mail.me.com",
     "rambler.ru": "imap.rambler.ru", "yahoo.com": "imap.mail.yahoo.com",
+    "gmx.de": "imap.gmx.net", "gmx.net": "imap.gmx.net", "gmx.at": "imap.gmx.net",
+    "gmx.ch": "imap.gmx.net", "gmx.com": "imap.gmx.net",
+    "web.de": "imap.web.de",
+    "t-online.de": "secureimap.t-online.de",
+    "freenet.de": "mx.freenet.de",
+    "1und1.de": "imap.1und1.de", "online.de": "imap.1und1.de",
+    "ionos.de": "imap.ionos.de",
+    "posteo.de": "posteo.de", "posteo.net": "posteo.de",
+    "mailbox.org": "imap.mailbox.org",
+    "aol.com": "imap.aol.com", "zoho.com": "imap.zoho.com",
 }
 HELP_PASS = {
     "gmail.com": "Gmail: включи двухэтапную аутентификацию и создай пароль приложения: myaccount.google.com/apppasswords",
     "yandex.ru": "Яндекс: id.yandex.ru → Безопасность → Пароли приложений (тип «Почта»), и включи IMAP в настройках почты.",
     "mail.ru": "Mail.ru: Настройки → Пароли для внешних приложений → создай пароль для почтового клиента.",
 }
+_GMX = ("GMX: зайди в почту → Einstellungen → E-Mail → POP3 &amp; IMAP → включи «Zugriff auf GMX Postfach per "
+        "POP3 und IMAP erlauben». Если включена двухфакторка — создай «Anwendungsspezifisches Passwort» "
+        "(Einstellungen → Sicherheit) и используй его.")
+for _d in ("gmx.de", "gmx.net", "gmx.at", "gmx.ch", "gmx.com"):
+    HELP_PASS[_d] = _GMX
+HELP_PASS["web.de"] = _GMX.replace("GMX", "WEB.DE").replace("GMX Postfach", "WEB.DE Postfach")
 
 db = sqlite3.connect(DB, check_same_thread=False)
 db.execute("""CREATE TABLE IF NOT EXISTS accounts(
@@ -453,9 +469,16 @@ async def add_email(m: Message, state: FSMContext):
         await m.answer(HELP_PASS.get(dom, "Нужен пароль приложения (не основной пароль).") +
                        "\n\nОтправь пароль приложения. Сообщение с ним я сразу удалю.", reply_markup=CANCEL_KB)
     else:
-        await state.set_state(Add.host)
-        await m.answer(f"Не знаю IMAP-сервер для {dom}. Напиши его, например <code>imap.{dom}</code>",
-                       reply_markup=CANCEL_KB)
+        guess = f"imap.{dom}"
+        try:
+            await asyncio.to_thread(socket.gethostbyname, guess)
+            await state.update_data(host=guess); await state.set_state(Add.pw)
+            await m.answer(f"Нашёл IMAP-сервер <code>{html.escape(guess)}</code>.\n\nОтправь пароль "
+                           "(лучше пароль приложения). Сообщение с ним я сразу удалю.", reply_markup=CANCEL_KB)
+        except OSError:
+            await state.set_state(Add.host)
+            await m.answer(f"Не знаю IMAP-сервер для {html.escape(dom)}. Напиши его, например "
+                           f"<code>imap.{html.escape(dom)}</code>", reply_markup=CANCEL_KB)
 
 @dp.message(Add.host)
 async def add_host(m: Message, state: FSMContext):
