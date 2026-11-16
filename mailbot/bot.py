@@ -502,22 +502,50 @@ async def add_pw(m: Message, state: FSMContext):
     d = await state.get_data(); pw = (m.text or "").strip()
     try: await m.delete()
     except Exception: pass
+    if "email" not in d or "host" not in d:
+        await state.clear()
+        return await m.answer("Данные добавления потерялись (бот перезапускался). Начни заново.",
+                              reply_markup=main_menu_kb())
+    status = await m.answer(f"⏳ Проверяю вход в <b>{html.escape(d['email'])}</b> ({html.escape(d['host'])})…")
     try:
         def check():
             c = imap_connect(d["host"], d["email"], pw)
             u = max_uid(c); c.logout(); return u
-        uid = await asyncio.to_thread(check)
+        uid = await asyncio.wait_for(asyncio.to_thread(check), timeout=60)
     except Exception as e:
+        log.warning("login failed %s @ %s: %r", d["email"], d["host"], e)
         await state.set_state(Add.pw)
-        return await m.answer(f"❌ Не удалось войти: <code>{html.escape(str(e))[:300]}</code>\n"
-                              "Проверь, что включён IMAP и используется пароль приложения. Пришли пароль ещё раз.",
-                              reply_markup=CANCEL_KB)
+        err = str(e) or type(e).__name__
+        return await status.edit_text(
+            f"❌ Не удалось войти: <code>{html.escape(err)[:300]}</code>\n"
+            "Проверь, что включён доступ по IMAP и используется пароль приложения (если есть двухфакторка). "
+            "Пришли пароль ещё раз.", reply_markup=CANCEL_KB)
     db.execute("INSERT OR IGNORE INTO accounts(chat_id,email,pw,host,last_uid) VALUES(?,?,?,?,?)",
                (m.chat.id, d["email"], FERNET.encrypt(pw.encode()).decode(), d["host"], uid))
     db.commit(); await state.clear()
-    await m.answer(f"✅ <b>{html.escape(d['email'])}</b> привязана. Старые письма не придут, только новые "
-                   f"(проверка раз в {INTERVAL} сек).")
+    log.info("mailbox added: %s @ %s", d["email"], d["host"])
+    await status.edit_text(f"✅ <b>{html.escape(d['email'])}</b> привязана. Старые письма не придут, только новые "
+                           f"(проверка раз в {INTERVAL} сек).")
     await m.answer(MAIN_TEXT, reply_markup=main_menu_kb())
+
+@dp.message()
+async def fallback(m: Message):
+    if not allowed(m):
+        return await m.answer("Нажми /start")
+    await m.answer("Не понял 🤔 Нажми «☰ Меню» или выбери действие кнопкой.", reply_markup=main_menu_kb())
+
+@dp.errors()
+async def on_error(event):
+    log.exception("unhandled error: %r", event.exception)
+    upd = event.update
+    chat = (upd.message.chat.id if upd.message else
+            upd.callback_query.message.chat.id if upd.callback_query and upd.callback_query.message else None)
+    if chat:
+        try:
+            await bot.send_message(chat, f"⚠️ Внутренняя ошибка: <code>{html.escape(repr(event.exception))[:300]}</code>")
+        except Exception:
+            pass
+    return True
 
 async def main():
     await bot.set_my_commands([BotCommand(command="start", description="Открыть меню")])
