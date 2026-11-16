@@ -27,6 +27,24 @@
 
 Чтобы научить бота новому типу писем — добавь правило в `CATEGORIES`/`classify()` в `bot.py` (матчинг по теме/телу письма).
 
+## Outlook / Hotmail: вход через Microsoft
+
+Microsoft не пускает личные ящики Outlook/Hotmail/Live по паролю, поэтому бот входит так же, как Thunderbird: показывает код и ссылку, пользователь сам входит на странице Microsoft и нажимает «Разрешить». Пароль боту не нужен.
+
+Один раз нужно создать «приложение» Microsoft (бесплатно) и дать боту его Client ID:
+
+1. Открой <https://entra.microsoft.com> (или portal.azure.com) и войди любой личной учёткой Microsoft.
+2. **App registrations → New registration**. Имя любое (например, MailBot). В «Supported account types» выбери вариант с **personal Microsoft accounts** (лучше «Accounts in any organizational directory and personal Microsoft accounts»). Redirect URI не нужен. Нажми **Register**.
+3. Слева **Authentication** → найди переключатель **Allow public client flows** → **Yes** → **Save**.
+4. На странице **Overview** скопируй **Application (client) ID**.
+5. Запусти установку с этим ID (на сервере от root):
+
+```
+curl -fsSL https://raw.githubusercontent.com/veritesClaude/hunay/ccr-5d79bc22-6d67we/mailbot/docker-install.sh | MS_CLIENT_ID=ВАШ_CLIENT_ID bash -s -- ТОКЕН_БОТА
+```
+
+Client ID запоминается на сервере (`/opt/mailbot-data/ms_client_id`), при обновлении его указывать повторно не нужно. После этого при добавлении адреса `@outlook.com/@hotmail.com/@live.com/…` бот сам покажет код и ссылку для входа.
+
 ## Установка в Docker, одной командой (на сервере, от root)
 
 ```
@@ -39,7 +57,7 @@ curl -fsSL https://raw.githubusercontent.com/veritesClaude/hunay/ccr-5d79bc22-6d
 
 Логи: `docker logs -f mailbot`
 Остановить: `docker stop mailbot`
-Обновить: удалить `/opt/mailbot-src`, перезапустить ту же команду.
+Обновить: перезапустить ту же команду. Ключ шифрования и данные хранятся в `/opt/mailbot-data` и сохраняются.
 
 ## Установка без Docker (systemd)
 

@@ -1,4 +1,5 @@
-import asyncio, imaplib, email, os, re, socket, sqlite3, html, logging
+import asyncio, imaplib, email, os, re, socket, sqlite3, html, logging, json, time
+import urllib.request, urllib.parse, urllib.error
 from email.header import decode_header, make_header
 from email.utils import parseaddr
 from aiogram import Bot, Dispatcher, F
@@ -19,6 +20,10 @@ FERNET = Fernet(os.environ["SECRET_KEY"].encode())
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_IDS", "").replace(" ", "").split(",") if x}
 INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 DB = os.getenv("DB_PATH", "mailbot.db")
+MS_CLIENT_ID = os.getenv("MS_CLIENT_ID", "").strip()
+MS_TENANT = os.getenv("MS_TENANT", "consumers").strip() or "consumers"
+MS_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+MS_DOMAINS = {"outlook.com", "outlook.de", "hotmail.com", "hotmail.de", "live.com", "live.de", "msn.com"}
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("mailbot")
 
@@ -56,7 +61,8 @@ for _d in ("gmx.de", "gmx.net", "gmx.at", "gmx.ch", "gmx.com", "mein.gmx", "gmx.
 _OUTLOOK = ("Outlook/Hotmail: включи двухэтапную проверку и создай пароль приложения "
             "(account.microsoft.com → Безопасность → Дополнительные параметры безопасности), "
             "IMAP должен быть включён. Если Microsoft не пускает по паролю — это их ограничение "
-            "на вход без OAuth, а не ошибка бота.")
+            "на вход без OAuth, а не ошибка бота: настрой вход через Microsoft (MS_CLIENT_ID, см. README) "
+            "или пересылку писем на GMX.")
 for _d in ("outlook.com", "outlook.de", "hotmail.com", "hotmail.de", "live.com", "live.de", "msn.com"):
     HELP_PASS[_d] = _OUTLOOK
 HELP_PASS["web.de"] = _GMX.replace("GMX", "WEB.DE").replace("GMX Postfach", "WEB.DE Postfach")
@@ -65,6 +71,10 @@ db = sqlite3.connect(DB, check_same_thread=False)
 db.execute("""CREATE TABLE IF NOT EXISTS accounts(
  id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, email TEXT, pw TEXT,
  host TEXT, last_uid INTEGER DEFAULT 0, UNIQUE(chat_id,email))""")
+try:
+    db.execute("ALTER TABLE accounts ADD COLUMN auth TEXT DEFAULT 'password'")
+except sqlite3.OperationalError:
+    pass
 db.execute("""CREATE TABLE IF NOT EXISTS category_prefs(
  chat_id INTEGER, category TEXT, notify INTEGER DEFAULT 1, body INTEGER DEFAULT 1,
  PRIMARY KEY(chat_id,category))""")
@@ -208,7 +218,7 @@ def users_view(me):
     return text, InlineKeyboardMarkup(inline_keyboard=kb)
 
 class Add(StatesGroup):
-    email = State(); host = State(); pw = State()
+    email = State(); host = State(); pw = State(); oauth = State()
 
 dp = Dispatcher(storage=MemoryStorage())
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -220,11 +230,40 @@ def dec(v):
     try: return str(make_header(decode_header(v or "")))
     except Exception: return v or ""
 
-def imap_connect(host, user, pw):
+def imap_connect(host, user, secret, oauth=False):
     c = imaplib.IMAP4_SSL(host, 993, timeout=30)
-    c.login(user, pw)
+    if oauth:
+        c.authenticate("XOAUTH2", lambda _: f"user={user}\x01auth=Bearer {secret}\x01\x01".encode())
+    else:
+        c.login(user, secret)
     c.select("INBOX", readonly=True)
     return c
+
+def ms_post(path, data):
+    req = urllib.request.Request(f"https://login.microsoftonline.com/{MS_TENANT}/oauth2/v2.0/{path}",
+                                  data=urllib.parse.urlencode(data).encode(),
+                                  headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try: return json.load(e)
+        except Exception: return {"error": f"http_{e.code}"}
+    except Exception as e:
+        return {"error": "network", "error_description": str(e)}
+
+_ms_cache = {}
+
+def ms_access(id_, refresh_token):
+    tok, exp = _ms_cache.get(id_, (None, 0))
+    if tok and exp > time.time() + 120:
+        return tok, refresh_token
+    r = ms_post("token", {"client_id": MS_CLIENT_ID, "grant_type": "refresh_token",
+                          "refresh_token": refresh_token, "scope": MS_SCOPE})
+    if "access_token" not in r:
+        raise RuntimeError(f"Microsoft: {r.get('error')}: {str(r.get('error_description', ''))[:150]}")
+    _ms_cache[id_] = (r["access_token"], time.time() + int(r.get("expires_in", 3600)))
+    return r["access_token"], r.get("refresh_token", refresh_token)
 
 def max_uid(c):
     typ, d = c.uid("search", None, "ALL")
@@ -247,8 +286,8 @@ def body_text(msg):
         return html.unescape(re.sub(r"<[^>]+>", "", t)).strip()
     return ""
 
-def fetch_new(host, user, pw, last_uid):
-    c = imap_connect(host, user, pw)
+def fetch_new(host, user, pw, last_uid, oauth=False):
+    c = imap_connect(host, user, pw, oauth)
     try:
         typ, d = c.uid("search", None, f"UID {last_uid + 1}:*")
         uids = sorted(int(x) for x in (d[0].split() if d and d[0] else []) if int(x) > last_uid)
@@ -269,10 +308,16 @@ def fetch_new(host, user, pw, last_uid):
 async def poll():
     while True:
         await asyncio.sleep(INTERVAL)
-        rows = db.execute("SELECT id,chat_id,email,pw,host,last_uid FROM accounts").fetchall()
-        for id_, _owner, em, pw, host, last in rows:
+        rows = db.execute("SELECT id,chat_id,email,pw,host,last_uid,COALESCE(auth,'password') FROM accounts").fetchall()
+        for id_, _owner, em, pw, host, last, auth in rows:
             try:
-                msgs, newlast = await asyncio.to_thread(fetch_new, host, em, FERNET.decrypt(pw.encode()).decode(), last)
+                secret = FERNET.decrypt(pw.encode()).decode()
+                if auth == "oauth":
+                    secret, new_rt = await asyncio.to_thread(ms_access, id_, secret)
+                    if FERNET.decrypt(pw.encode()).decode() != new_rt:
+                        db.execute("UPDATE accounts SET pw=? WHERE id=?", (FERNET.encrypt(new_rt.encode()).decode(), id_))
+                        db.commit()
+                msgs, newlast = await asyncio.to_thread(fetch_new, host, em, secret, last, auth == "oauth")
                 for u, name, addr, subj, date, body, files in msgs:
                     cat = classify(subj, body)
                     head = (f"📬 <b>Новое письмо</b> → {html.escape(em)}\n"
@@ -473,6 +518,9 @@ async def add_email(m: Message, state: FSMContext):
         return await m.answer(MAIN_TEXT, reply_markup=main_menu_kb())
     dom = em.split("@")[1]
     await state.update_data(email=em)
+    if dom in MS_DOMAINS and MS_CLIENT_ID:
+        await state.update_data(host=HOSTS[dom])
+        return await start_oauth(m, state)
     if dom in HOSTS:
         await state.update_data(host=HOSTS[dom]); await state.set_state(Add.pw)
         await m.answer(HELP_PASS.get(dom, "Нужен пароль приложения (не основной пароль).") +
@@ -488,6 +536,75 @@ async def add_email(m: Message, state: FSMContext):
             await state.set_state(Add.host)
             await m.answer(f"Не знаю IMAP-сервер для {html.escape(dom)}. Напиши его, например "
                            f"<code>imap.{html.escape(dom)}</code>", reply_markup=CANCEL_KB)
+
+async def start_oauth(m: Message, state: FSMContext):
+    d = await state.get_data()
+    r = await asyncio.to_thread(ms_post, "devicecode", {"client_id": MS_CLIENT_ID, "scope": MS_SCOPE})
+    if "device_code" not in r:
+        log.warning("devicecode failed: %s", r)
+        await state.set_state(Add.pw)
+        err = f"{r.get('error')}: {str(r.get('error_description', ''))[:200]}"
+        return await m.answer(f"❌ Не удалось начать вход через Microsoft: <code>{html.escape(err)}</code>\n\n"
+                              "Можно попробовать пароль приложения — пришли его.", reply_markup=CANCEL_KB)
+    code = r["device_code"]
+    link = r.get("verification_uri", "https://microsoft.com/link")
+    await state.set_state(Add.oauth); await state.update_data(device_code=code)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Открыть страницу Microsoft", url=link)],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="menu:cancel")]])
+    msg = await m.answer(f"🔐 <b>Вход через Microsoft</b>\n\n1️⃣ Открой {html.escape(link)}\n"
+                         f"2️⃣ Введи код: <code>{html.escape(r['user_code'])}</code>\n"
+                         f"3️⃣ Войди в <b>{html.escape(d['email'])}</b> и нажми «Разрешить».\n\n"
+                         f"⏳ Жду подтверждения (код действует {int(r.get('expires_in', 900)) // 60} мин)…",
+                         reply_markup=kb)
+    asyncio.create_task(oauth_wait(msg, state, m.chat.id, d["email"], d["host"], r))
+
+async def oauth_wait(msg, state, chat_id, em, host, r):
+    code, interval = r["device_code"], int(r.get("interval", 5))
+    deadline = time.time() + int(r.get("expires_in", 900))
+    async def fail(text):
+        await state.clear()
+        try: await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:main")]]))
+        except Exception: pass
+    while time.time() < deadline:
+        await asyncio.sleep(interval)
+        if await state.get_state() != Add.oauth.state or (await state.get_data()).get("device_code") != code:
+            return
+        t = await asyncio.to_thread(ms_post, "token", {
+            "client_id": MS_CLIENT_ID, "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "device_code": code})
+        err = t.get("error")
+        if err == "authorization_pending": continue
+        if err == "slow_down": interval += 5; continue
+        if "access_token" not in t:
+            log.warning("oauth failed %s: %s", em, t)
+            return await fail(f"❌ Вход через Microsoft не удался: <code>{html.escape(str(err))}</code>\n"
+                              f"{html.escape(str(t.get('error_description', ''))[:200])}")
+        try:
+            def check():
+                c = imap_connect(host, em, t["access_token"], True)
+                u = max_uid(c); c.logout(); return u
+            uid = await asyncio.wait_for(asyncio.to_thread(check), timeout=60)
+        except Exception as e:
+            log.warning("oauth imap failed %s: %r", em, e)
+            return await fail(f"❌ Вход прошёл, но почта не открылась: <code>{html.escape(str(e) or type(e).__name__)[:300]}</code>\n"
+                              "Проверь, что ты вошла именно в этот ящик.")
+        cur = db.execute("INSERT OR IGNORE INTO accounts(chat_id,email,pw,host,last_uid,auth) VALUES(?,?,?,?,?,'oauth')",
+                         (chat_id, em, FERNET.encrypt(t.get("refresh_token", "").encode()).decode(), host, uid))
+        db.commit()
+        if cur.lastrowid:
+            _ms_cache[cur.lastrowid] = (t["access_token"], time.time() + int(t.get("expires_in", 3600)))
+        await state.clear()
+        log.info("mailbox added (oauth): %s @ %s", em, host)
+        await msg.edit_text(f"✅ <b>{html.escape(em)}</b> привязана через Microsoft. Старые письма не придут, "
+                            f"только новые (проверка раз в {INTERVAL} сек).")
+        return await bot.send_message(chat_id, MAIN_TEXT, reply_markup=main_menu_kb())
+    await fail("⌛ Время на вход вышло. Нажми «➕ Добавить почту» и попробуй снова.")
+
+@dp.message(Add.oauth)
+async def add_oauth_wait_msg(m: Message):
+    await m.answer("Жду, пока ты войдёшь на странице Microsoft с кодом выше. Или нажми «❌ Отмена» под сообщением.")
 
 @dp.message(Add.host)
 async def add_host(m: Message, state: FSMContext):
